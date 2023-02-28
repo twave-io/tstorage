@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nakabonne/tstorage/internal/cgroup"
-	"github.com/nakabonne/tstorage/internal/timerpool"
+	"github.com/twave-io/tstorage/internal/cgroup"
+	"github.com/twave-io/tstorage/internal/timerpool"
 )
 
 var (
@@ -25,7 +25,8 @@ var (
 	// goroutines on data ingestion path.
 	defaultWorkersLimit = cgroup.AvailableCPUs()
 
-	partitionDirRegex = regexp.MustCompile(`^p-.+`)
+	partitionDirRegex   = regexp.MustCompile(`^p-.+`)
+	partitionFilesRegex = regexp.MustCompile(`p-.+[/\\\\].+`)
 )
 
 // TimestampPrecision represents precision of timestamps. See WithTimestampPrecision
@@ -42,6 +43,10 @@ const (
 	defaultTimestampPrecision = Nanoseconds
 	defaultWriteTimeout       = 30 * time.Second
 	defaultWALBufferedSize    = 4096
+
+	defaultPartitionMaxSize = 50000            // 50000 data points per partition
+	defaultDatabaseMaxSize  = 1024 * 1024 * 10 // 10MiB per database
+	defaultMaxPartitions    = 200              // 200 partitions per database
 
 	writablePartitionsNum = 2
 	checkExpiredInterval  = time.Hour
@@ -89,6 +94,40 @@ type DataPoint struct {
 
 // Option is an optional setting for NewStorage.
 type Option func(*storage)
+
+// WithPartitionMaxSize specifies the maximum number of points a partition
+// can have before been substuted by a new one.
+//
+// Defaults to 50000 data points.
+func WithPartitionMaxSize(partitionMaxSize int64) Option {
+	return func(s *storage) {
+		s.partitionMaxSize = partitionMaxSize
+	}
+}
+
+// WithDatabaseMaxSize specifies the maximum size the database can have.
+// Higher size leads to deletion of oldest partitions until the database
+// fits within the maximum stablished size.
+//
+// Defaults to 10MiB.
+func WithDatabaseMaxSize(databaseMaxSize int64) Option {
+	return func(s *storage) {
+		s.databaseMaxSize = databaseMaxSize
+	}
+}
+
+// WithMaxPartitions specifies the maximum amount of partitions the database
+// can have. Higher number leads to deletion of oldest partitions, until the
+// database fits within the maximum. Memory partitions are not taken in
+// consideration.
+//
+// Defaults to 200 partitions. A value of 0 implies the same behaviour as the
+// in memory mode, which means no data will be persisted.
+func WithMaxPartitions(maxPartitions int64) Option {
+	return func(s *storage) {
+		s.maxPartitions = maxPartitions
+	}
+}
 
 // WithDataPath specifies the path to directory that stores time-series data.
 // Use this to make time-series data persistent on disk.
@@ -182,6 +221,9 @@ func NewStorage(opts ...Option) (Storage, error) {
 		wal:                &nopWAL{},
 		logger:             &nopLogger{},
 		doneCh:             make(chan struct{}, 0),
+		partitionMaxSize:   defaultPartitionMaxSize,
+		databaseMaxSize:    defaultDatabaseMaxSize,
+		maxPartitions:      defaultMaxPartitions,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -192,6 +234,7 @@ func NewStorage(opts ...Option) (Storage, error) {
 		return s, nil
 	}
 
+	// TODO: Possible point for multiple database implementation (for T8 integration)
 	if err := os.MkdirAll(s.dataPath, fs.ModePerm); err != nil {
 		return nil, fmt.Errorf("failed to make data directory %s: %w", s.dataPath, err)
 	}
@@ -277,6 +320,9 @@ type storage struct {
 	timestampPrecision TimestampPrecision
 	dataPath           string
 	writeTimeout       time.Duration
+	partitionMaxSize   int64
+	databaseMaxSize    int64
+	maxPartitions      int64
 
 	logger         Logger
 	workersLimitCh chan struct{}
@@ -293,6 +339,9 @@ func (s *storage) InsertRows(rows []Row) error {
 	insert := func() error {
 		defer func() { <-s.workersLimitCh }()
 		if err := s.ensureActiveHead(); err != nil {
+			return err
+		}
+		if err := s.ensureHeadInSize(); err != nil {
 			return err
 		}
 		iterator := s.partitionList.newIterator()
@@ -359,6 +408,27 @@ func (s *storage) ensureActiveHead() error {
 	return nil
 }
 
+// ensureHeadInSize ensures the head of partitionList is under its maximum defined size.
+// If none, it creates a new one.
+func (s *storage) ensureHeadInSize() error {
+	head := s.partitionList.getHead()
+	if head != nil && head.underMaxSize() {
+		return nil
+	}
+
+	// Head partition does not exist or exceds size
+	if err := s.newPartition(nil, true); err != nil {
+		return err
+	}
+	go func() {
+		if err := s.flushPartitions(); err != nil {
+			s.logger.Printf("failed to flush in-memory partitions: %v", err)
+		}
+	}()
+
+	return nil
+}
+
 func (s *storage) Select(metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
 	if metric == "" {
 		return nil, fmt.Errorf("metric must be set")
@@ -416,10 +486,12 @@ func (s *storage) Close() error {
 		if err := s.newPartition(nil, true); err != nil {
 			return err
 		}
+
+		if err := s.flushPartitions(); err != nil {
+			return fmt.Errorf("failed to close storage: %w", err)
+		}
 	}
-	if err := s.flushPartitions(); err != nil {
-		return fmt.Errorf("failed to close storage: %w", err)
-	}
+
 	if err := s.removeExpiredPartitions(); err != nil {
 		return fmt.Errorf("failed to remove expired partitions: %w", err)
 	}
@@ -432,13 +504,71 @@ func (s *storage) Close() error {
 
 func (s *storage) newPartition(p partition, punctuateWal bool) error {
 	if p == nil {
-		p = newMemoryPartition(s.wal, s.partitionDuration, s.timestampPrecision)
+		// Check for max database size
+		// Only when there are disk partitions, hence more than 2
+		if s.partitionList.size() > 2 {
+			overSize, err := s.checkDBOverMaxSize()
+			if err != nil {
+				return fmt.Errorf("failed to check database maximum size: %w", err)
+			}
+
+			for overSize {
+				tail := s.partitionList.getTail()
+				s.partitionList.remove(tail)
+
+				overSize, err = s.checkDBOverMaxSize()
+				if err != nil {
+					return fmt.Errorf("failed to check database maximum size: %w", err)
+				}
+			}
+		}
+
+		p = newMemoryPartition(s.wal, s.partitionDuration, s.timestampPrecision, s.partitionMaxSize)
 	}
 	s.partitionList.insert(p)
+
+	// Check for max partitions
+	// Only when there are disk partitions, hence more than 2
+	// If in memory mode, innecesary
+	if !s.inMemoryMode() && s.partitionList.size() > 2 {
+		numPart := s.partitionList.size() - 2
+		for ; numPart > int(s.maxPartitions); numPart-- {
+			tail := s.partitionList.getTail()
+			s.partitionList.remove(tail)
+		}
+	}
+
 	if punctuateWal {
 		return s.wal.punctuate()
 	}
 	return nil
+}
+
+// Returns whether the database has exceeded its maximum size
+func (s *storage) checkDBOverMaxSize() (bool, error) {
+	var size int64
+	err := filepath.WalkDir(s.dataPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !partitionFilesRegex.MatchString(path) || d.IsDir() {
+			return nil
+		}
+
+		fInfo, err := d.Info()
+		if err != nil {
+			return err
+		}
+		size += fInfo.Size()
+
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to walk database directory: %w", err)
+	}
+
+	return size > s.databaseMaxSize, err
 }
 
 // flushPartitions persists all in-memory partitions ready to persisted.
@@ -612,5 +742,5 @@ func (s *storage) recoverWAL(walDir string) error {
 }
 
 func (s *storage) inMemoryMode() bool {
-	return s.dataPath == ""
+	return s.dataPath == "" || s.maxPartitions == 0 || s.databaseMaxSize == 0
 }

@@ -11,13 +11,14 @@ import (
 // A memoryPartition implements a partition to store data points on heap.
 // It offers a goroutine safe capabilities.
 type memoryPartition struct {
-	// A hash map from metric name to memoryMetric.
-	metrics sync.Map
 	// The number of data points
 	numPoints int64
 	// minT is immutable.
 	minT int64
 	maxT int64
+
+	// A hash map from metric name to memoryMetric.
+	metrics sync.Map
 
 	// Write ahead log.
 	wal wal
@@ -25,9 +26,12 @@ type memoryPartition struct {
 	partitionDuration  int64
 	timestampPrecision TimestampPrecision
 	once               sync.Once
+
+	// Maximum number of points after which a partition gets persisted
+	partitionMaxSize int64
 }
 
-func newMemoryPartition(wal wal, partitionDuration time.Duration, precision TimestampPrecision) partition {
+func newMemoryPartition(wal wal, partitionDuration time.Duration, precision TimestampPrecision, partitionMaxSize int64) partition {
 	if wal == nil {
 		wal = &nopWAL{}
 	}
@@ -48,6 +52,7 @@ func newMemoryPartition(wal wal, partitionDuration time.Duration, precision Time
 		partitionDuration:  d,
 		wal:                wal,
 		timestampPrecision: precision,
+		partitionMaxSize:   partitionMaxSize,
 	}
 }
 
@@ -56,7 +61,8 @@ func (m *memoryPartition) insertRows(rows []Row) ([]Row, error) {
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("no rows given")
 	}
-	// FIXME: Just emitting log is enough
+	// FIXME: Just emitting log is enoughAlex Edwards - Let's Go
+
 	err := m.wal.append(operationInsert, rows)
 	if err != nil {
 		return nil, fmt.Errorf("failed to write to WAL: %w", err)
@@ -156,6 +162,10 @@ func (m *memoryPartition) active() bool {
 	return m.maxTimestamp()-m.minTimestamp()+1 < m.partitionDuration
 }
 
+func (m *memoryPartition) underMaxSize() bool {
+	return m.numPoints < m.partitionMaxSize
+}
+
 func (m *memoryPartition) clean() error {
 	// What all data managed by memoryPartition is on heap that is automatically removed by GC.
 	// So do nothing.
@@ -168,10 +178,12 @@ func (m *memoryPartition) expired() bool {
 
 // memoryMetric has a list of ordered data points that belong to the memoryMetric
 type memoryMetric struct {
-	name         string
 	size         int64
 	minTimestamp int64
 	maxTimestamp int64
+
+	name string
+
 	// points must kept in order
 	points           []*DataPoint
 	outOfOrderPoints []*DataPoint

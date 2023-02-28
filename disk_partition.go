@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nakabonne/tstorage/internal/syscall"
+	"github.com/twave-io/tstorage/internal/syscall"
 )
 
 const (
@@ -159,6 +159,12 @@ func (d *diskPartition) size() int {
 
 // Disk partition is immutable.
 func (d *diskPartition) active() bool {
+	return false
+}
+
+// Disk partition will always be in size, given a memory partition
+// will be flushed after checking that.
+func (d *diskPartition) underMaxSize() bool {
 	return false
 }
 
