@@ -45,3 +45,7 @@ func (f *fakePartition) clean() error {
 func (f *fakePartition) expired() bool {
 	return false
 }
+
+func (f *fakePartition) listMetrics() ([]string, error) {
+	return nil, nil
+}

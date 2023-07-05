@@ -183,3 +183,18 @@ func (d *diskPartition) expired() bool {
 	}
 	return false
 }
+
+// func (m *diskPartition) selectAllRows() ([]*Row, error) {
+// 	// Iterate all metrics, decoding data points and conforming rows with them
+
+// 	return nil, fmt.Errorf("can't select rows from memory partition")
+// }
+
+// TODO: revise
+func (d *diskPartition) listMetrics() ([]string, error) {
+	metrics := make([]string, 0, len(d.meta.Metrics))
+	for _, m := range d.meta.Metrics {
+		metrics = append(metrics, m.Name)
+	}
+	return metrics, nil
+}

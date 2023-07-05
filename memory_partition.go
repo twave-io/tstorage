@@ -176,6 +176,35 @@ func (m *memoryPartition) expired() bool {
 	return false
 }
 
+// func (m *memoryPartition) selectAllRows() ([]*Row, error) {
+// 	// Iterate all metrics, conforming rows and return them.
+// 	rows := make([]*Row, 0)
+// 	m.metrics.Range(func(key, value interface{}) bool {
+// 		metric := value.(*memoryMetric)
+// 		metric.mu.RLock()
+// 		defer metric.mu.RUnlock()
+// 		for _, point := range metric.points {
+// 			rows = append(rows, &Row{
+// 				Metric:    metric.name,
+// 				DataPoint: *point,
+// 			})
+// 		}
+// 		return true
+// 	})
+
+// 	return rows, nil
+// }
+
+// TODO: revise
+func (m *memoryPartition) listMetrics() ([]string, error) {
+	metrics := make([]string, 0)
+	m.metrics.Range(func(key, value interface{}) bool {
+		metrics = append(metrics, key.(string))
+		return true
+	})
+	return metrics, nil
+}
+
 // memoryMetric has a list of ordered data points that belong to the memoryMetric
 type memoryMetric struct {
 	size         int64
