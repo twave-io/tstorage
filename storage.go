@@ -73,6 +73,8 @@ type Reader interface {
 	Select(metric string, labels []Label, start, end int64) (points []*DataPoint, err error)
 	// ListMetrics returns a list of metric names.
 	ListMetrics() ([]string, error)
+	// LastTimestamp returns the last timestamp of the given metric and labels.
+	LastTimestamp(metric string, labels []Label) (int64, error)
 }
 
 // Row includes a data point along with properties to identify a kind of metrics.
@@ -499,6 +501,36 @@ func (s *storage) ListMetrics() ([]string, error) {
 		return nil, fmt.Errorf("no metrics found")
 	}
 	return metrics, nil
+}
+
+func (s *storage) LastTimestamp(metric string, labels []Label) (int64, error) {
+	if metric == "" {
+		return 0, fmt.Errorf("metric must be set")
+	}
+	last := int64(0)
+	// Iterate over all partitions from the newest one.
+	iterator := s.partitionList.newIterator()
+	for iterator.next() {
+		part := iterator.value()
+		if part == nil {
+			return 0, fmt.Errorf("unexpected empty partition found")
+		}
+		if part.minTimestamp() == 0 {
+			// Skip the partition that has no points.
+			continue
+		}
+		ps, err := part.selectDataPoints(metric, labels, 0, time.Now().UnixNano())
+		if errors.Is(err, ErrNoDataPoints) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("failed to select data points: %w", err)
+		}
+		// We obtain the last timestamp from the last data point of the last partition containing data points for the given metric.
+		last = ps[len(ps)-1].Timestamp
+	}
+
+	return last, nil
 }
 
 func (s *storage) Close() error {
