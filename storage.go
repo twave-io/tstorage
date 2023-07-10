@@ -73,8 +73,8 @@ type Reader interface {
 	Select(metric string, labels []Label, start, end int64) (points []*DataPoint, err error)
 	// ListMetrics returns a list of metric names.
 	ListMetrics() ([]string, error)
-	// LastTimestamp returns the last timestamp of the given metric and labels.
-	LastTimestamp(metric string, labels []Label) (int64, error)
+	// LastTimestamp returns the last timestamp in the most recent partition.
+	LastTimestamp() int64
 }
 
 // Row includes a data point along with properties to identify a kind of metrics.
@@ -476,7 +476,7 @@ func (s *storage) Select(metric string, labels []Label, start, end int64) ([]*Da
 	return points, nil
 }
 
-// TODO: SelectAll()
+// TODO: Tests to cover this method.
 func (s *storage) ListMetrics() ([]string, error) {
 	metrics := make([]string, 0)
 
@@ -503,6 +503,7 @@ func (s *storage) ListMetrics() ([]string, error) {
 	return metrics, nil
 }
 
+/*
 func (s *storage) LastTimestamp(metric string, labels []Label) (int64, error) {
 	if metric == "" {
 		return 0, fmt.Errorf("metric must be set")
@@ -531,6 +532,29 @@ func (s *storage) LastTimestamp(metric string, labels []Label) (int64, error) {
 	}
 
 	return last, nil
+}
+*/
+
+func (s *storage) LastTimestamp() int64 {
+	var ts int64
+
+	// Iterate partitions from the newest one.
+	iterator := s.partitionList.newIterator()
+	for iterator.next() {
+		part := iterator.value()
+		if part == nil {
+			// If no partition exists, return 0.
+			return 0
+		}
+		if part.minTimestamp() == 0 {
+			// Skip the partition if it has no points.
+			continue
+		}
+		ts = part.maxTimestamp()
+		break
+	}
+
+	return ts
 }
 
 func (s *storage) Close() error {
