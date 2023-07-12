@@ -75,6 +75,8 @@ type Reader interface {
 	ListMetrics() ([]string, error)
 	// LastTimestamp returns the last timestamp in the most recent partition.
 	LastTimestamp() int64
+	// DataPath returns the path to directory that stores time-series data.
+	DataPath() string
 }
 
 // Row includes a data point along with properties to identify a kind of metrics.
@@ -555,6 +557,10 @@ func (s *storage) LastTimestamp() int64 {
 	}
 
 	return ts
+}
+
+func (s *storage) DataPath() string {
+	return s.dataPath
 }
 
 func (s *storage) Close() error {
