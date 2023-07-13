@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // partitionList represents a linked list for partitions.
@@ -78,6 +80,16 @@ func (p *partitionListImpl) getTail() partition {
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
+	// Credit to @ekimeel for the following optimization.
+	if p.tail == nil {
+		log.Warn("tail partition not found, attempting to recover tail")
+		i := p.newIterator()
+		for i.next() {
+			p.tail = i.currentNode()
+		}
+	}
+
 	return p.tail.value()
 }
 
